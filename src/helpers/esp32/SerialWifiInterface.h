@@ -45,6 +45,8 @@ public:
   }
 
   void begin(int port);
+  // drops the client and listens on another port
+  void restartServer(int port);
 
   // BaseSerialInterface methods
   void enable() override;

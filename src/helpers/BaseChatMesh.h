@@ -64,7 +64,6 @@ class BaseChatMesh : public mesh::Mesh {
   ContactInfo contacts[MAX_CONTACTS+MAX_ANON_CONTACTS];
   int num_contacts;
   int sort_array[MAX_CONTACTS+MAX_ANON_CONTACTS];
-  int matching_peer_indexes[MAX_SEARCH_RESULTS];
   unsigned long txt_send_timeout;
 #ifdef MAX_GROUP_CHANNELS
   ChannelDetails channels[MAX_GROUP_CHANNELS];
@@ -78,6 +77,9 @@ class BaseChatMesh : public mesh::Mesh {
   void sendAckTo(const ContactInfo& dest, const uint8_t* ack_hash, uint8_t ack_len=4);
 
 protected:
+  // results of searchPeersByHash(), for the 'peer' methods (sub-classes may add their own peers)
+  int matching_peer_indexes[MAX_SEARCH_RESULTS];
+
   BaseChatMesh(mesh::Radio& radio, mesh::MillisecondClock& ms, mesh::RNG& rng, mesh::RTCClock& rtc, mesh::PacketManager& mgr, mesh::MeshTables& tables)
       : mesh::Mesh(radio, ms, rng, rtc, mgr, tables)
   {

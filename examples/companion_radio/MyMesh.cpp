@@ -350,6 +350,15 @@ void MyMesh::onContactsFull() {
   }
 }
 
+void MyMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp,
+                          const uint8_t* app_data, size_t app_data_len) {
+  // no RTC and no app has set the time yet: take it from the adverts of other nodes
+  if (_time_sync.onAdvert(*getRTCClock(), id.pub_key, timestamp)) {
+    MESH_DEBUG_PRINTLN("clock set from adverts: %lu", (unsigned long)getRTCClock()->getCurrentTime());
+  }
+  BaseChatMesh::onAdvertRecv(packet, id, timestamp, app_data, app_data_len);
+}
+
 void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) {
   if (_serial->isConnected()) {
     if (is_new) {
@@ -423,6 +432,13 @@ ContactInfo*  MyMesh::processAck(const uint8_t *data) {
 
       // NOTE: the same ACK can be received multiple times!
       expected_ack_table[i].ack = 0; // clear expected hash, now that we have received ACK
+#ifdef DISPLAY_CLASS
+      if (_ui) {
+        uint32_t ack;
+        memcpy(&ack, data, 4);
+        _ui->onAckReceived(ack);
+      }
+#endif
       return expected_ack_table[i].contact;
     }
   }
@@ -469,6 +485,7 @@ void MyMesh::queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packe
   bool should_display = txt_type == TXT_TYPE_PLAIN || txt_type == TXT_TYPE_SIGNED_PLAIN;
   if (should_display && _ui) {
     _ui->newMsg(path_len, from.name, text, offline_queue_len);
+    _ui->onContactMessage(from, sender_timestamp, text);
     if (!_serial->isConnected()) {
       _ui->notify(UIEventType::contactMessage);
     }
@@ -585,7 +602,10 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
   if (getChannel(channel_idx, channel_details)) {
     channel_name = channel_details.name;
   }
-  if (_ui) _ui->newMsg(path_len, channel_name, text, offline_queue_len);
+  if (_ui) {
+    _ui->newMsg(path_len, channel_name, text, offline_queue_len);
+    _ui->onChannelMessage(channel_idx, timestamp, text);
+  }
 #endif
 }
 
@@ -626,6 +646,11 @@ void MyMesh::onChannelDataRecv(const mesh::GroupChannel &channel, mesh::Packet *
 
 uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_timestamp, const uint8_t *data,
                                  uint8_t len, uint8_t *reply) {
+  if (isRepeaterMode()) {
+    // a contact that knows us as a repeater: answer like one
+    if (data[0] == REQ_TYPE_GET_STATUS) return repStatus(sender_timestamp, reply);
+    if (data[0] == REQ_TYPE_GET_TELEMETRY_DATA) return repTelemetry(sender_timestamp, reply);
+  }
   if (data[0] == REQ_TYPE_GET_TELEMETRY_DATA) {
     uint8_t permissions = 0;
     uint8_t cp = contact.flags >> 1; // LSB used as 'favourite' bit (so only use upper bits)
@@ -864,6 +889,8 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
     : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables),
       _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _ui(ui), _iter(0) {
   _iter_started = false;
+  _iter_target = -1;
+  for (int i = 0; i < REP_MAX_GUESTS; i++) _rep_guests[i].used = false;
   _cli_rescue = false;
   offline_queue_len = 0;
   app_target_ver = 0;
@@ -988,6 +1015,44 @@ const char *MyMesh::getNodeName() {
 NodePrefs *MyMesh::getNodePrefs() {
   return &_prefs;
 }
+int MyMesh::uiSendDirect(const uint8_t* pub_key_prefix6, const char* text, uint32_t& expected_ack, uint32_t& est_timeout) {
+  expected_ack = 0;
+  est_timeout = 0;
+  ContactInfo* recipient = lookupContactByPubKey(pub_key_prefix6, 6);
+  if (recipient == NULL) return MSG_SEND_FAILED;
+  uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+  int result = sendMessage(*recipient, ts, 0, text, expected_ack, est_timeout);
+  if (result != MSG_SEND_FAILED && expected_ack) {
+    // same table as messages from the app, so processAck() finds it
+    expected_ack_table[next_ack_idx].msg_sent = _ms->getMillis();
+    expected_ack_table[next_ack_idx].ack = expected_ack;
+    expected_ack_table[next_ack_idx].contact = recipient;
+    next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
+  }
+  return result;
+}
+
+bool MyMesh::uiSendChannel(int channel_idx, const char* text) {
+  ChannelDetails ch;
+  if (!getChannel(channel_idx, ch) || ch.name[0] == 0) return false;
+  uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+  return sendGroupMessage(ts, ch.channel, _prefs.node_name, text, strlen(text));
+}
+
+int MyMesh::uiAddChannel(const char* name, const uint8_t secret[16]) {
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    ChannelDetails ch;
+    if (!getChannel(i, ch) || ch.name[0] != 0) continue;   // slot in use
+    memset(&ch, 0, sizeof(ch));
+    StrHelper::strncpy(ch.name, name, sizeof(ch.name));
+    memcpy(ch.channel.secret, secret, 16);                 // 128-bit key
+    if (!setChannel(i, ch)) return -1;
+    saveChannels();
+    return i;
+  }
+  return -1;   // no free slot
+}
+
 uint32_t MyMesh::getBLEPin() {
   return _active_ble_pin;
 }
@@ -1047,7 +1112,9 @@ void MyMesh::handleCmdFrame(size_t len) {
     cmd_frame[len] = 0; // make app_name null terminated
     MESH_DEBUG_PRINTLN("App %s connected", app_name);
 
-    _iter_started = false; // stop any left-over ContactsIterator
+    if (_iter_target == _serial->getReplyTarget()) {
+      _iter_started = false; // stop any left-over ContactsIterator (of this client only)
+    }
     int i = 0;
     out_frame[i++] = RESP_CODE_SELF_INFO;
     out_frame[i++] = ADV_TYPE_CHAT; // what this node Advert identifies as (maybe node's pronouns too?? :-)
@@ -1207,6 +1274,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       // start iterator
       _iter = startContactsIterator();
       _iter_started = true;
+      _iter_target = _serial->getReplyTarget();
       _most_recent_lastmod = 0;
     }
   } else if (cmd_frame[0] == CMD_SET_ADVERT_NAME && len >= 2) {
@@ -1249,11 +1317,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     }
   } else if (cmd_frame[0] == CMD_SEND_SELF_ADVERT) {
     mesh::Packet* pkt;
-    if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
-      pkt = createSelfAdvert(_prefs.node_name);
-    } else {
-      pkt = createSelfAdvert(_prefs.node_name, sensors.node_lat, sensors.node_lon);
-    }
+    pkt = createOwnAdvert();
     if (pkt) {
       if (len >= 2 && cmd_frame[1] == 1) { // optional param (1 = flood, 0 = zero hop)
         unsigned long delay_millis = 0;
@@ -1333,11 +1397,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     if (len < 1 + PUB_KEY_SIZE) {
       // export SELF
       mesh::Packet* pkt;
-      if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
-        pkt = createSelfAdvert(_prefs.node_name);
-      } else {
-        pkt = createSelfAdvert(_prefs.node_name, sensors.node_lat, sensors.node_lon);
-      }
+      pkt = createOwnAdvert();   // same type as our adverts (companion / repeater)
       if (pkt) {
         pkt->header |= ROUTE_TYPE_FLOOD; // would normally be sent in this mode
 
@@ -2206,6 +2266,11 @@ void MyMesh::checkSerialInterface() {
   } else if (_iter_started              // check if our ContactsIterator is 'running'
              && !_serial->isWriteBusy() // don't spam the Serial Interface too quickly!
   ) {
+    // contact frames go to the client that asked for them, even if another
+    // client has sent a command in the meantime
+    int prev_target = _serial->getReplyTarget();
+    _serial->setReplyTarget(_iter_target);
+
     ContactInfo contact;
     if (_iter.hasNext(this, contact)) {
       if (contact.lastmod > _iter_filter_since) { // apply the 'since' filter
@@ -2221,6 +2286,8 @@ void MyMesh::checkSerialInterface() {
       _serial->writeFrame(out_frame, 5);
       _iter_started = false;
     }
+
+    _serial->setReplyTarget(prev_target);
   //} else if (!_serial->isWriteBusy()) {
   //  checkConnections();    // TODO - deprecate the 'Connections' stuff
   }
@@ -2246,13 +2313,208 @@ void MyMesh::loop() {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Repeater mode: when this node advertises as a repeater, apps treat it like
+// one (login, status, telemetry, "ping"). Same wire formats as simple_repeater.
+
+#define REP_RESP_LOGIN_OK     0
+#define REP_ANON_TYPE_BASIC   0x03     // "ping": reply with our clock
+#define REP_FW_VER_LEVEL      2
+#define REP_RESPONSE_DELAY    300
+
+struct RepeaterStatsWire {             // layout of RepeaterStats in simple_repeater
+  uint16_t batt_milli_volts;
+  uint16_t curr_tx_queue_len;
+  int16_t  noise_floor;
+  int16_t  last_rssi;
+  uint32_t n_packets_recv;
+  uint32_t n_packets_sent;
+  uint32_t total_air_time_secs;
+  uint32_t total_up_time_secs;
+  uint32_t n_sent_flood, n_sent_direct;
+  uint32_t n_recv_flood, n_recv_direct;
+  uint16_t err_events;
+  int16_t  last_snr;   // x 4
+  uint16_t n_direct_dups, n_flood_dups;
+  uint32_t total_rx_air_time_secs;
+  uint32_t n_recv_errors;
+};
+
+MyMesh::RepGuest* MyMesh::repGuest(const mesh::Identity& id, const uint8_t* secret, bool create) {
+  for (int i = 0; i < REP_MAX_GUESTS; i++) {
+    if (_rep_guests[i].used && id.matches(_rep_guests[i].id)) return &_rep_guests[i];
+  }
+  if (!create) return NULL;
+  RepGuest* g = &_rep_guests[_rep_guest_next];          // oldest slot is reused
+  _rep_guest_next = (_rep_guest_next + 1) % REP_MAX_GUESTS;
+  g->id = id;
+  memcpy(g->secret, secret, PUB_KEY_SIZE);
+  g->last_timestamp = 0;
+  g->used = true;
+  return g;
+}
+
+int MyMesh::repStatus(uint32_t tag, uint8_t* out) {
+  memcpy(out, &tag, 4);       // reflect the sender timestamp, like a tag
+  RepeaterStatsWire st;
+  memset(&st, 0, sizeof(st));
+  st.batt_milli_volts = board.getBattMilliVolts();
+  st.curr_tx_queue_len = _mgr->getOutboundTotal();
+  st.noise_floor = (int16_t)radio_driver.getNoiseFloor();
+  st.last_rssi = (int16_t)radio_driver.getLastRSSI();
+  st.n_packets_recv = radio_driver.getPacketsRecv();
+  st.n_packets_sent = radio_driver.getPacketsSent();
+  st.total_air_time_secs = getTotalAirTime() / 1000;
+  st.total_up_time_secs = _ms->getMillis() / 1000;
+  st.n_sent_flood = getNumSentFlood();
+  st.n_sent_direct = getNumSentDirect();
+  st.n_recv_flood = getNumRecvFlood();
+  st.n_recv_direct = getNumRecvDirect();
+  st.last_snr = (int16_t)(radio_driver.getLastSNR() * 4);
+  st.n_direct_dups = ((SimpleMeshTables*)getTables())->getNumDirectDups();
+  st.n_flood_dups = ((SimpleMeshTables*)getTables())->getNumFloodDups();
+  st.total_rx_air_time_secs = getReceiveAirTime() / 1000;
+  st.n_recv_errors = radio_driver.getPacketsRecvErrors();
+  memcpy(&out[4], &st, sizeof(st));
+  return 4 + sizeof(st);
+}
+
+int MyMesh::repTelemetry(uint32_t tag, uint8_t* out) {
+  // what a repeater gives guests: base telemetry (voltage, MCU temperature)
+  telemetry.reset();
+  telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
+  sensors.querySensors(TELEM_PERM_BASE, telemetry);
+  float temperature = board.getMCUTemperature();
+  if (!isnan(temperature)) telemetry.addTemperature(TELEM_CHANNEL_SELF, temperature);
+  memcpy(out, &tag, 4);
+  uint8_t tlen = telemetry.getSize();
+  memcpy(&out[4], telemetry.getBuffer(), tlen);
+  return 4 + tlen;
+}
+
+void MyMesh::repReply(mesh::Packet* request, const mesh::Identity& to, const uint8_t* secret,
+                      const uint8_t* data, int len, const uint8_t* path, int path_len) {
+  TransportKey scope;
+  memcpy(&scope.key, _prefs.default_scope_key, sizeof(scope.key));
+  auto route = mesh::chooseReplyRoute(request->isRouteFlood(), path_len >= 0, false);
+  if (route == mesh::REPLY_ROUTE_PATH_RETURN) {
+    // tell the sender the path to us, and carry the response along
+    mesh::Packet* p = createPathReturn(to, secret, request->path, request->path_len, PAYLOAD_TYPE_RESPONSE, data, len);
+    if (p) sendFloodScoped(scope, p, REP_RESPONSE_DELAY);
+    return;
+  }
+  mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, to, secret, data, len);
+  if (!reply) return;
+  if (route == mesh::REPLY_ROUTE_DIRECT_SUPPLIED) sendDirect(reply, path, path_len, REP_RESPONSE_DELAY);
+  else sendFloodScoped(scope, reply, REP_RESPONSE_DELAY);
+}
+
+void MyMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender,
+                            uint8_t* data, size_t len) {
+  if (!isRepeaterMode() || packet->getPayloadType() != PAYLOAD_TYPE_ANON_REQ || len < 5) return;
+  uint32_t timestamp;
+  memcpy(&timestamp, data, 4);
+  data[len] = 0;
+  uint8_t out[16];
+
+  if (data[4] == 0 || data[4] >= ' ') {
+    // login (the password is ignored: guest role only, nothing can be changed remotely)
+    RepGuest* g = repGuest(sender, secret, true);
+    if (timestamp <= g->last_timestamp) return;   // replay
+    g->last_timestamp = timestamp;
+    memcpy(g->secret, secret, PUB_KEY_SIZE);
+    uint32_t now = getRTCClock()->getCurrentTimeUnique();
+    memcpy(out, &now, 4);
+    out[4] = REP_RESP_LOGIN_OK;
+    out[5] = 0;                 // legacy keep-alive interval
+    out[6] = 0;                 // not admin
+    out[7] = 0;                 // permissions: guest
+    getRNG()->random(&out[8], 4);
+    out[12] = REP_FW_VER_LEVEL;
+    repReply(packet, sender, secret, out, 13, NULL, -1);
+  } else if (data[4] == REP_ANON_TYPE_BASIC && packet->isRouteDirect() && len >= 6) {
+    // "ping": {reply-path-len}{reply-path} -> our clock + features
+    uint8_t path_len = data[5];
+    if (!mesh::Packet::isValidPathLen(path_len)) return;
+    uint8_t path[MAX_PATH_SIZE];
+    mesh::Packet::writePath(path, &data[6], path_len);
+    memcpy(out, &timestamp, 4);
+    uint32_t now = getRTCClock()->getCurrentTime();
+    memcpy(&out[4], &now, 4);
+    out[8] = _prefs.isRepeatEn() ? 0 : 0x80;   // 0x80 = forwarding disabled
+    repReply(packet, sender, secret, out, 9, path, path_len);
+  }
+}
+
+int MyMesh::searchPeersByHash(const uint8_t* hash) {
+  int n = BaseChatMesh::searchPeersByHash(hash);
+  if (isRepeaterMode()) {
+    for (int i = 0; i < REP_MAX_GUESTS && n < MAX_SEARCH_RESULTS; i++) {
+      if (_rep_guests[i].used && _rep_guests[i].id.isHashMatch(hash)) matching_peer_indexes[n++] = REP_GUEST_IDX_BASE + i;
+    }
+  }
+  return n;
+}
+
+void MyMesh::getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) {
+  int i = matching_peer_indexes[peer_idx];
+  if (i >= REP_GUEST_IDX_BASE) {
+    memcpy(dest_secret, _rep_guests[i - REP_GUEST_IDX_BASE].secret, PUB_KEY_SIZE);
+  } else {
+    BaseChatMesh::getPeerSharedSecret(dest_secret, peer_idx);
+  }
+}
+
+void MyMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx, const uint8_t* secret,
+                            uint8_t* data, size_t len) {
+  int i = matching_peer_indexes[sender_idx];
+  if (i < REP_GUEST_IDX_BASE) {
+    BaseChatMesh::onPeerDataRecv(packet, type, sender_idx, secret, data, len);
+    return;
+  }
+  RepGuest& g = _rep_guests[i - REP_GUEST_IDX_BASE];
+  if (type != PAYLOAD_TYPE_REQ || len < 5) return;
+  uint32_t timestamp;
+  memcpy(&timestamp, data, 4);
+  if (timestamp <= g.last_timestamp) return;      // replay
+  uint8_t out[MAX_PACKET_PAYLOAD];
+  int n = 0;
+  if (data[4] == REQ_TYPE_GET_STATUS) n = repStatus(timestamp, out);
+  else if (data[4] == REQ_TYPE_GET_TELEMETRY_DATA) n = repTelemetry(timestamp, out);
+  if (n == 0) return;
+  g.last_timestamp = timestamp;
+  repReply(packet, g.id, secret, out, n, NULL, -1);
+}
+
+mesh::Packet* MyMesh::createOwnAdvert() {
+  uint8_t app_data[MAX_ADVERT_DATA_SIZE];
+  uint8_t app_data_len;
+  if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
+    AdvertDataBuilder builder(_advert_type, _prefs.node_name);
+    app_data_len = builder.encodeTo(app_data);
+  } else {
+    AdvertDataBuilder builder(_advert_type, _prefs.node_name, sensors.node_lat, sensors.node_lon);
+    app_data_len = builder.encodeTo(app_data);
+  }
+  return createAdvert(self_id, app_data, app_data_len);
+}
+
+bool MyMesh::uiSendAdvert(bool flood) {
+  mesh::Packet* pkt = createOwnAdvert();
+  if (!pkt) return false;
+  if (flood) {
+    TransportKey default_scope;
+    memcpy(&default_scope.key, _prefs.default_scope_key, sizeof(default_scope.key));
+    sendFloodScoped(default_scope, pkt, 0);
+  } else {
+    sendZeroHop(pkt);
+  }
+  return true;
+}
+
 bool MyMesh::advert() {
   mesh::Packet* pkt;
-  if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
-    pkt = createSelfAdvert(_prefs.node_name);
-  } else {
-    pkt = createSelfAdvert(_prefs.node_name, sensors.node_lat, sensors.node_lon);
-  }
+  pkt = createOwnAdvert();
   if (pkt) {
     sendZeroHop(pkt);
     return true;

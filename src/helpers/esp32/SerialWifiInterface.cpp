@@ -6,6 +6,15 @@ void SerialWifiInterface::begin(int port) {
   server.begin(port);
 }
 
+void SerialWifiInterface::restartServer(int port) {
+  client.stop();
+  deviceConnected = false;
+  resetReceivedFrameHeader();
+  clearBuffers();
+  server.end();
+  server.begin(port);
+}
+
 // ---------- public methods
 void SerialWifiInterface::enable() { 
   if (_isEnabled) return;

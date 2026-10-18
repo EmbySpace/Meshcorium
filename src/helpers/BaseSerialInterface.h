@@ -19,4 +19,9 @@ public:
   virtual bool isWriteBusy() const = 0;
   virtual size_t writeFrame(const uint8_t src[], size_t len) = 0;
   virtual size_t checkRecvFrame(uint8_t dest[]) = 0;
+
+  // Multi-client support (MultiSerialInterface): which client a reply goes to.
+  // -1 = no specific client. Single-client interfaces ignore this.
+  virtual int getReplyTarget() const { return -1; }
+  virtual void setReplyTarget(int target) { }
 };

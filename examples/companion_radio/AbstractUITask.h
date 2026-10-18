@@ -5,6 +5,7 @@
 #include <helpers/ui/UIScreen.h>
 #include <helpers/SensorManager.h>
 #include <helpers/MultiSerialInterface.h>
+#include <helpers/ContactInfo.h>
 #include <Arduino.h>
 
 #ifdef PIN_BUZZER
@@ -39,6 +40,13 @@ public:
   bool isBluetoothEnabled() const { return _interfaceManager->isBluetoothEnabled(); }
   void enableBluetooth() { _interfaceManager->enableBluetooth(); }
   void disableBluetooth() { _interfaceManager->disableBluetooth(); }
+  // optional, for UIs that keep their own chat history: which contact /
+  // channel a message belongs to, and delivery confirmations of messages the
+  // UI sent itself (see MyMesh::uiSendDirect)
+  virtual void onContactMessage(const ContactInfo& from, uint32_t sender_timestamp, const char* text) { }
+  virtual void onChannelMessage(int channel_idx, uint32_t timestamp, const char* text) { }
+  virtual void onAckReceived(uint32_t ack) { }
+
   virtual void msgRead(int msgcount) = 0;
   virtual void newMsg(uint8_t path_len, const char* from_name, const char* text, int msgcount) = 0;
   virtual void notify(UIEventType t = UIEventType::none) = 0;

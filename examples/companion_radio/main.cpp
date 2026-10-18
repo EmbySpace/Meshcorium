@@ -125,12 +125,16 @@ void setup() {
   DisplayDriver* disp = NULL;
   if (display.begin()) {
     disp = &display;
+  #ifdef DISPLAY_HAS_SPLASH
+    display.showSplash(FIRMWARE_VERSION);   // the display's own boot screen
+  #else
     disp->startFrame();
-  #ifdef ST7789
+    #ifdef ST7789
     disp->setTextSize(2);
-  #endif
+    #endif
     disp->drawTextCentered(disp->width() / 2, 28, "Loading...");
     disp->endFrame();
+  #endif
   }
 #endif
 

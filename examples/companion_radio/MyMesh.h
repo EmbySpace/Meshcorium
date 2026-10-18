@@ -28,6 +28,8 @@
 
 #include <RTClib.h>
 #include <helpers/ArduinoHelpers.h>
+#include <helpers/AdvertTimeSync.h>
+#include <helpers/RoutingPolicy.h>
 #include <helpers/BaseSerialInterface.h>
 #include <helpers/IdentityStore.h>
 #include <helpers/SimpleMeshTables.h>
@@ -95,6 +97,25 @@ public:
   NodePrefs *getNodePrefs();
   uint32_t getBLEPin();
 
+  // ---- for on-device UIs (messages written on the node's own screen) ----
+  // direct message to a contact; returns MSG_SEND_*, the ACK is reported to
+  // the UI through AbstractUITask::onAckReceived()
+  int uiSendDirect(const uint8_t* pub_key_prefix6, const char* text, uint32_t& expected_ack, uint32_t& est_timeout);
+  bool uiSendChannel(int channel_idx, const char* text);
+  // stores a new 128-bit channel in the first free slot; returns its index or -1
+  int uiAddChannel(const char* name, const uint8_t secret[16]);
+  const uint8_t* getSelfPubKey() const { return self_id.pub_key; }
+  // what this node's adverts identify it as (ADV_TYPE_CHAT by default,
+  // ADV_TYPE_REPEATER makes other apps list it as a repeater)
+  void setAdvertType(uint8_t type) { _advert_type = type; }
+  uint8_t getAdvertType() const { return _advert_type; }
+  // advert now: flood = whole mesh (default scope, like the app), else zero hop
+  bool uiSendAdvert(bool flood);
+  // packet forwarding on the current frequency (the app only allows it on
+  // the fixed repeat frequencies, see isValidClientRepeatFreq)
+  void uiSetRepeat(bool on) { _prefs.setRepeatEn(on); savePrefs(); }
+  bool isRepeatOn() const { return _prefs.isRepeatEn(); }
+
   void loop();
   void handleCmdFrame(size_t len);
   bool advert();
@@ -126,6 +147,15 @@ protected:
   void onContactOverwrite(const uint8_t* pub_key) override;
   bool onContactPathRecv(ContactInfo& from, uint8_t* in_path, uint8_t in_path_len, uint8_t* out_path, uint8_t out_path_len, uint8_t extra_type, uint8_t* extra, uint8_t extra_len) override;
   void onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) override;
+
+  // ---- repeater mode (advert type ADV_TYPE_REPEATER): answer like a repeater ----
+  // guest login, "ping" (basic anon request: our clock), status and telemetry
+  // requests from apps that see this node as a repeater
+  void onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender, uint8_t* data, size_t len) override;
+  int searchPeersByHash(const uint8_t* hash) override;
+  void getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) override;
+  void onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx, const uint8_t* secret, uint8_t* data, size_t len) override;
+  void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len) override;
   void onContactPathUpdated(const ContactInfo &contact) override;
   ContactInfo* processAck(const uint8_t *data) override;
   void queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packet *pkt, uint32_t sender_timestamp,
@@ -221,7 +251,28 @@ private:
   uint32_t _iter_filter_since;
   uint32_t _most_recent_lastmod;
   uint32_t _active_ble_pin;
+  uint8_t _advert_type = ADV_TYPE_CHAT;
+  bool isRepeaterMode() const { return _advert_type == ADV_TYPE_REPEATER; }
+
+  #define REP_MAX_GUESTS     8
+  #define REP_GUEST_IDX_BASE 1000        // guest entries in matching_peer_indexes[]
+  struct RepGuest {                      // apps logged in to us as a repeater (guest role)
+    mesh::Identity id;
+    uint8_t secret[PUB_KEY_SIZE];
+    uint32_t last_timestamp;
+    bool used;
+  };
+  RepGuest _rep_guests[REP_MAX_GUESTS];
+  int _rep_guest_next = 0;
+  RepGuest* repGuest(const mesh::Identity& id, const uint8_t* secret, bool create);
+  int repStatus(uint32_t tag, uint8_t* out);
+  int repTelemetry(uint32_t tag, uint8_t* out);
+  void repReply(mesh::Packet* request, const mesh::Identity& to, const uint8_t* secret,
+                const uint8_t* data, int len, const uint8_t* path, int path_len);
+  mesh::Packet* createOwnAdvert();
+  AdvertTimeSync _time_sync;   // sets the clock from adverts while it is not set
   bool _iter_started;
+  int _iter_target;     // client (interface) the running ContactsIterator replies to
   bool _cli_rescue;
   bool send_unscoped;   // force un-scoped flood (instead of using send_scope)
   char cli_command[80];
